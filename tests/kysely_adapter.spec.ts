@@ -193,6 +193,49 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
 })
 
 test.group('KyselyAdapter | SQLite file, two connections', () => {
+  test('claims from two connections race with dispatches without failing', async ({
+    assert,
+    cleanup,
+  }) => {
+    const directory = await mkdtemp(join(tmpdir(), 'queue-sqlite-'))
+    const connect = () => {
+      const database = new Database(join(directory, 'queue.sqlite'))
+      database.pragma('journal_mode = WAL')
+      return new Kysely<QueueDatabase>({ dialect: new SqliteDialect({ database }) })
+    }
+    const first = connect()
+    const second = connect()
+    cleanup(async () => {
+      await first.destroy()
+      await second.destroy()
+      await rm(directory, { recursive: true, force: true })
+    })
+
+    await new KyselyQueueSchemaService(first, { dialect: 'sqlite' }).createJobsTable()
+    const adapters = [first, second].map(
+      (connection) => new KyselyAdapter({ connection, dialect: 'sqlite' })
+    )
+    adapters.forEach((adapter, index) => adapter.setWorkerId(`worker-${index}`))
+
+    for (let round = 0; round < 20; round++) {
+      // One connection dispatches while both claim, as a web process and a worker would.
+      const results = await Promise.allSettled([
+        adapters[0].pushOn('default', {
+          id: `job-${round}`,
+          name: 'TestJob',
+          payload: {},
+          attempts: 0,
+        }),
+        ...adapters.map((adapter) => adapter.popFrom('default')),
+      ])
+
+      assert.deepEqual(
+        results.filter((result) => result.status === 'rejected'),
+        []
+      )
+    }
+  })
+
   test('concurrent upserts from two connections all succeed', async ({ assert, cleanup }) => {
     const directory = await mkdtemp(join(tmpdir(), 'queue-sqlite-'))
     const connect = () => {

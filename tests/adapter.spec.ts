@@ -2364,6 +2364,44 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
 })
 
 test.group('Adapter | Knex (SQLite file, two connections)', () => {
+  test('claims from two connections race with dispatches without failing', async ({
+    assert,
+    cleanup,
+  }) => {
+    const directory = await mkdtemp(join(tmpdir(), 'queue-sqlite-'))
+    const connect = () =>
+      Knex({
+        client: 'better-sqlite3',
+        connection: { filename: join(directory, 'queue.sqlite') },
+        useNullAsDefault: true,
+        pool: { afterCreate: (db: any, done: any) => done(null, db.pragma('journal_mode = WAL')) },
+      })
+    const first = connect()
+    const second = connect()
+    cleanup(async () => {
+      await first.destroy()
+      await second.destroy()
+      await rm(directory, { recursive: true, force: true })
+    })
+
+    await new KnexQueueSchemaService(first).createJobsTable()
+    const adapters = [first, second].map((connection) => new KnexAdapter({ connection }))
+    adapters.forEach((adapter, index) => adapter.setWorkerId(`worker-${index}`))
+
+    for (let round = 0; round < 20; round++) {
+      // One connection dispatches while both claim, as a web process and a worker would.
+      const results = await Promise.allSettled([
+        adapters[0].pushOn('default', { id: `job-${round}`, name: 'TestJob', payload: {}, attempts: 0 }),
+        ...adapters.map((adapter) => adapter.popFrom('default')),
+      ])
+
+      assert.deepEqual(
+        results.filter((result) => result.status === 'rejected'),
+        []
+      )
+    }
+  })
+
   test('concurrent upserts from two connections all succeed', async ({ assert, cleanup }) => {
     const directory = await mkdtemp(join(tmpdir(), 'queue-sqlite-'))
     const connect = () =>
